@@ -1,0 +1,6 @@
+# requirements.txt
+
+Flask==3.0.3
+gunicorn==23.0.0
+google-cloud-bigquery==3.34.0
+google-cloud-monitoring==2.28.0
