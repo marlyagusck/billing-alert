@@ -1,21 +1,20 @@
-# main.py
-
+import logging
 import os
 import time
-import logging
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from google.cloud import bigquery
 from google.cloud import monitoring_v3
+from google.protobuf.timestamp_pb2 import Timestamp
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-PROJECT_ID = os.environ["PROJECT_ID"]
+PROJECT_ID = os.getenv("PROJECT_ID", "pgd-pgd-oiti-infra")
 
 QUERY = """
 SELECT
-  ROUND(SUM(cost), 2) AS total_cost_7d
+  COALESCE(ROUND(SUM(cost), 2), 0) AS total_cost_7d
 FROM
   `pgd-pgd-oiti-infra.billing_info.gcp_billing_export_resource_v1_01DF20_DD2658_424F64`
 WHERE
@@ -27,22 +26,32 @@ WHERE
 METRIC_TYPE = "custom.googleapis.com/billing/bigquery_cost_7d"
 
 
+@app.route("/healthz", methods=["GET"])
+def health_check():
+    return jsonify({"status": "healthy"}), 200
+
+
 @app.route("/", methods=["POST"])
 def run_billing_check():
     try:
+        request_json = request.get_json(silent=True) or {}
+        logging.info(f"Request received: {request_json}")
+
         total_cost = get_billing_cost()
+
         write_metric(total_cost)
 
         return jsonify(
             {
                 "status": "success",
+                "project_id": PROJECT_ID,
                 "metric": METRIC_TYPE,
                 "value": total_cost,
             }
         ), 200
 
     except Exception as exc:
-        logging.exception(exc)
+        logging.exception("Failed to process billing metric")
 
         return jsonify(
             {
@@ -55,21 +64,22 @@ def run_billing_check():
 def get_billing_cost():
     client = bigquery.Client(project=PROJECT_ID)
 
+    logging.info("Executing BigQuery query")
+
     query_job = client.query(QUERY)
 
     rows = list(query_job.result())
 
     if not rows:
+        logging.warning("No rows returned from BigQuery")
+
         return 0.0
 
-    value = rows[0].total_cost_7d
+    total_cost = float(rows[0].total_cost_7d or 0)
 
-    if value is None:
-        return 0.0
+    logging.info(f"7-day BigQuery cost: {total_cost}")
 
-    logging.info(f"7-day cost: {value}")
-
-    return float(value)
+    return total_cost
 
 
 def write_metric(metric_value):
@@ -79,15 +89,35 @@ def write_metric(metric_value):
 
     series = monitoring_v3.TimeSeries()
 
+    # Custom metric
     series.metric.type = METRIC_TYPE
 
+    # Optional metric labels
+    series.metric.labels["service"] = "bigquery"
+
+    # Required monitored resource
     series.resource.type = "global"
+    series.resource.labels["project_id"] = PROJECT_ID
 
-    point = series.points.add()
+    now = Timestamp()
+    now.FromSeconds(int(time.time()))
 
-    point.value.double_value = metric_value
+    interval = monitoring_v3.TimeInterval(
+        end_time=now
+    )
 
-    point.interval.end_time.seconds = int(time.time())
+    point = monitoring_v3.Point(
+        interval=interval,
+        value=monitoring_v3.TypedValue(
+            double_value=metric_value
+        ),
+    )
+
+    series.points.append(point)
+
+    logging.info(
+        f"Writing metric: {METRIC_TYPE}={metric_value}"
+    )
 
     client.create_time_series(
         name=project_name,
@@ -95,10 +125,13 @@ def write_metric(metric_value):
     )
 
     logging.info(
-        f"Metric written successfully: {metric_value}"
+        f"Successfully wrote metric "
+        f"{METRIC_TYPE}={metric_value}"
     )
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-```
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8080)),
+    )
